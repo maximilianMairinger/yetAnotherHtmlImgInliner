@@ -1,0 +1,41 @@
+{
+  "name": "yet-another-html-img-inliner",
+  "version": "0.1.1",
+  "description": "Inline local <img src> and srcset references in HTML into data: URLs (no remote fetches).",
+  "type": "module",
+  "bin": {
+    "yet-another-html-img-inliner": "index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "html",
+    "inline",
+    "images",
+    "img",
+    "srcset",
+    "data-url",
+    "base64",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.17"
+  },
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/<you>/yet-another-html-img-inliner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/<you>/yet-another-html-img-inliner/issues"
+  },
+  "homepage": "https://github.com/<you>/yet-another-html-img-inliner#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}
