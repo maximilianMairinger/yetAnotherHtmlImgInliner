@@ -29,12 +29,12 @@
   "sideEffects": false,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<you>/yet-another-html-img-inliner.git"
+    "url": "git+https://github.com/maximilianMairinger/yetAnotherHtmlImgInliner.git"
   },
   "bugs": {
-    "url": "https://github.com/<you>/yet-another-html-img-inliner/issues"
+    "url": "https://github.com/maximilianMairinger/yetAnotherHtmlImgInliner/issues"
   },
-  "homepage": "https://github.com/<you>/yet-another-html-img-inliner#readme",
+  "homepage": "https://github.com/maximilianMairinger/yetAnotherHtmlImgInliner#readme",
   "publishConfig": {
     "access": "public"
   }
