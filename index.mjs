@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
- * inline-local-images.mjs  —  v2.0
- * Inlines <img src> and srcset entries into data: URLs.
- * - Now supports http(s): and protocol-relative // URLs (downloads & inlines).
- * - Skips existing data: URLs.
- * - URL-decodes %XX in local paths; strips ?query/#hash for local lookups.
- * - Case-insensitive fallback resolution across path segments (locals).
- * - Warns once per missing/too-large/unreadable/failed-remote file.
- * - Resolves locals relative to input file dir, or --root.
+ * inline-local-images.mjs
+ *
+ * Inlines <img src> and srcset entries into base64 data: URLs.
+ * - Local files (with robust resolution) and remote URLs (http/https + //).
+ * - Skips data: URLs.
+ * - URL-decodes local paths; strips ?query/#hash; case-insensitive traversal fallback.
+ * - Enforces --maxMB for local and remote (honors Content-Length; hard cutoff when streaming).
+ * - Caches repeated remote URLs in a single run.
+ * - Uses Cheerio to preserve the original HTML structure/attributes/whitespace.
  *
  * Usage:
  *   node inline-local-images.mjs <input.html> [-o output.html] [--root DIR] [--maxMB 10]
@@ -18,7 +19,9 @@ import path from "path";
 import url from "url";
 import http from "http";
 import https from "https";
+import cheerio from "cheerio";
 
+// ---------------- MIME map ----------------
 const extsToMime = {
   png:  "image/png",
   jpg:  "image/jpeg",
@@ -31,27 +34,18 @@ const extsToMime = {
   avif: "image/avif"
 };
 
+// ---------------- CLI helpers ----------------
 function usageAndExit() {
   console.error(`Usage: node inline-local-images.mjs <input.html> [-o output.html] [--root DIR] [--maxMB 10]`);
   process.exit(1);
 }
 
-function isDataUrl(src) {
-  return /^data:/i.test(src);
-}
+// ---------------- general helpers ----------------
+const isDataUrl = (s) => /^data:/i.test(s);
+const isRemote  = (s) => /^(https?:|\/\/)/i.test(s);
+const normalizeRemoteUrl = (u) => u.startsWith("//") ? "https:" + u : u;
 
-function isRemote(src) {
-  return /^(https?:|\/\/)/i.test(src);
-}
-
-function normalizeRemoteUrl(u) {
-  return u.startsWith("//") ? "https:" + u : u;
-}
-
-function decodeMaybeURI(p) {
-  try { return decodeURI(p); } catch { return p; }
-}
-
+function decodeMaybeURI(p) { try { return decodeURI(p); } catch { return p; } }
 function stripQueryHash(p) {
   const iQ = p.indexOf("?");
   const iH = p.indexOf("#");
@@ -67,6 +61,8 @@ function stripQueryHash(p) {
  * - if not found, tries case-insensitive traversal segment-by-segment
  */
 function resolveLocalPath(rawSrc, baseDir) {
+  if (!rawSrc) return rawSrc;
+
   if (rawSrc.startsWith("file://")) {
     try { return url.fileURLToPath(rawSrc); } catch { /* fall through */ }
   }
@@ -77,6 +73,7 @@ function resolveLocalPath(rawSrc, baseDir) {
   const candidate = path.resolve(baseDir, noQH);
   if (fs.existsSync(candidate)) return candidate;
 
+  // Case-insensitive traversal
   const norm = path.normalize(noQH);
   const parts = norm.split(/[\\/]+/).filter(Boolean);
   let cur = path.resolve(baseDir);
@@ -95,7 +92,7 @@ function resolveLocalPath(rawSrc, baseDir) {
 function bufferToDataUrl(buf, fallbackPathOrExt, contentTypeHeader) {
   let mime = null;
 
-  // Prefer server-provided content-type if present and looks like image/*
+  // Prefer HTTP header when it looks like an image
   if (contentTypeHeader && /^image\/[a-z0-9.+-]+/i.test(contentTypeHeader)) {
     mime = contentTypeHeader.split(";")[0].trim();
   }
@@ -110,27 +107,24 @@ function bufferToDataUrl(buf, fallbackPathOrExt, contentTypeHeader) {
   }
 
   if (!mime) mime = "application/octet-stream";
-  const base64 = Buffer.from(buf).toString("base64");
-  return `data:${mime};base64,${base64}`;
+  return `data:${mime};base64,${Buffer.from(buf).toString("base64")}`;
 }
 
+// ---------------- local to data URL ----------------
 function toDataUrlLocal(filePath, maxBytes) {
   if (!fs.existsSync(filePath)) return { ok: false, reason: "not_found" };
   const stat = fs.statSync(filePath);
   if (!stat.isFile()) return { ok: false, reason: "not_file" };
   if (stat.size > maxBytes) return { ok: false, reason: "too_large", size: stat.size };
-
-  let buf;
   try {
-    buf = fs.readFileSync(filePath);
+    const buf = fs.readFileSync(filePath);
+    return { ok: true, dataUrl: bufferToDataUrl(buf, filePath) };
   } catch (e) {
     return { ok: false, reason: "read_error", err: e };
   }
-
-  return { ok: true, dataUrl: bufferToDataUrl(buf, filePath) };
 }
 
-// ---- Remote fetching (http/https) with redirects and hard size cap ----
+// ---------------- remote fetch with limits ----------------
 async function fetchRemoteBuffer(u, maxBytes, { timeoutMs = 15000, maxRedirects = 5 } = {}) {
   const visited = new Set();
 
@@ -148,7 +142,7 @@ async function fetchRemoteBuffer(u, maxBytes, { timeoutMs = 15000, maxRedirects 
         port: uObj.port,
         path: uObj.pathname + uObj.search,
         headers: {
-          "User-Agent": "inline-local-images/2.0 (+https://example.invalid)",
+          "User-Agent": "inline-local-images/3.0",
           "Accept": "*/*",
           "Accept-Encoding": "identity"
         },
@@ -156,7 +150,7 @@ async function fetchRemoteBuffer(u, maxBytes, { timeoutMs = 15000, maxRedirects 
       }, (res) => {
         const { statusCode = 0, headers } = res;
 
-        // Handle redirects
+        // Redirects
         if ([301,302,303,307,308].includes(statusCode)) {
           res.resume(); // drain
           const loc = headers.location;
@@ -207,7 +201,8 @@ async function toDataUrlRemote(remoteUrl, maxBytes) {
   const normalized = normalizeRemoteUrl(remoteUrl);
   try {
     const { buffer, contentType } = await fetchRemoteBuffer(normalized, maxBytes);
-    return { ok: true, dataUrl: bufferToDataUrl(buffer, path.extname(new URL(normalized).pathname).slice(1), contentType) };
+    const ext = path.extname(new URL(normalized).pathname).slice(1);
+    return { ok: true, dataUrl: bufferToDataUrl(buffer, ext, contentType) };
   } catch (e) {
     const reasonMap = {
       timeout: "remote_timeout",
@@ -218,35 +213,19 @@ async function toDataUrlRemote(remoteUrl, maxBytes) {
       too_large_stream: "too_large",
     };
     const msg = String(e?.message || "");
-    const httpMatch = msg.startsWith("http_") ? "remote_http_error" : null;
-    const reason = reasonMap[msg] || httpMatch || "remote_error";
+    const reason = msg.startsWith("http_") ? "remote_http_error" : (reasonMap[msg] || "remote_error");
     const out = { ok: false, reason };
     if (e?.size) out.size = e.size;
     return out;
   }
 }
 
-function replaceAttrInTag(tag, attr, newValue, originalValue) {
-  const re = new RegExp(`\\b${attr}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s"'=<>` + "`" + `]+))`, "i");
-  return tag.replace(re, (m, _full, d1, d2, d3) => {
-    const quote = m.includes('"') ? '"' : (m.includes("'") ? "'" : '"');
-    const old = d1 ?? d2 ?? d3 ?? originalValue;
-    return m.replace(old, newValue).replace(/=(\s*)(["'])?[^"']*?(["'])?/, `=$1${quote}${newValue}${quote}`);
-  });
-}
-
-function getAttrFromTag(tag, attr = "src") {
-  const re = new RegExp(`\\b${attr}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s"'=<>` + "`" + `]+))`, "i");
-  const m = tag.match(re);
-  if (!m) return null;
-  return m[2] ?? m[3] ?? m[4] ?? null;
-}
-
-// Warn-once helper
+// ---------------- warnings ----------------
 const seenWarn = new Set();
 function warnOnce(key, resOrMsg) {
   if (seenWarn.has(key)) return;
   seenWarn.add(key);
+
   if (typeof resOrMsg === "string") {
     console.error(`[warn] ${resOrMsg}`);
     return;
@@ -266,106 +245,87 @@ function warnOnce(key, resOrMsg) {
   console.error(`[warn] ${key} → ${reasons[resOrMsg.reason] || resOrMsg.reason}`);
 }
 
-// cache for remote URLs within this run
-const remoteCache = new Map(); // url -> Promise<{ok, dataUrl}|{ok:false,...}>
+// ---------------- srcset parsing ----------------
+/**
+ * Split a srcset string into item strings (handles simple cases).
+ * Note: The formal grammar is complex; this covers typical usage (no URLs with unescaped commas).
+ */
+function splitSrcset(srcset) {
+  // Keep it simple: split on commas, trim each
+  return srcset.split(",").map(s => s.trim()).filter(Boolean);
+}
 
-async function transformSrcsetValue(srcset, baseDir, maxBytes) {
-  const parts = srcset.split(",").map(s => s.trim()).filter(Boolean);
-  const out = [];
+/**
+ * Parse one srcset item into { url, descriptor }.
+ * Example items: "image-1x.png 1x", "image-100w.png 100w", "image.png"
+ */
+function parseSrcsetItem(item) {
+  const m = item.match(/^(\S+)(\s+\S+)?$/);
+  if (!m) return { url: null, descriptor: null, raw: item };
+  const url = m[1];
+  const descriptor = (m[2] || "").trim() || null;
+  return { url, descriptor, raw: item };
+}
 
-  for (const part of parts) {
-    const match = part.match(/^(\S+)(\s+\S+)?$/);
-    if (!match) { out.push(part); continue; }
+// ---------------- main HTML processing (Cheerio) ----------------
+async function processHtmlWithCheerio(html, baseDir, maxBytes, counters) {
+  const $ = cheerio.load(html, { decodeEntities: false });
+  const remoteCache = new Map(); // url -> Promise<{ok,dataUrl}|{ok:false,...}>
 
-    const urlPart = match[1];
-    const descriptor = (match[2] || "").trim();
+  const inlineUrl = async (rawUrl, warnCtx) => {
+    if (!rawUrl || isDataUrl(rawUrl)) return rawUrl;
 
-    if (isDataUrl(urlPart)) { out.push(part); continue; }
-
-    // remote?
-    if (isRemote(urlPart)) {
-      const key = `remote:${urlPart}`;
-      const p = remoteCache.get(urlPart) || toDataUrlRemote(urlPart, maxBytes);
-      remoteCache.set(urlPart, p);
-      const res = await p;
-      if (res.ok) out.push(descriptor ? `${res.dataUrl} ${descriptor}` : res.dataUrl);
-      else { warnOnce(`srcset:${urlPart}`, res); out.push(part); }
-      continue;
+    if (isRemote(rawUrl)) {
+      const promise = remoteCache.get(rawUrl) || toDataUrlRemote(rawUrl, maxBytes);
+      remoteCache.set(rawUrl, promise);
+      const res = await promise;
+      if (res.ok) { counters.replacedCount++; return res.dataUrl; }
+      warnOnce(`${warnCtx}:${rawUrl}`, res);
+      return rawUrl;
     }
 
-    // local file
-    const resolved = resolveLocalPath(urlPart, baseDir);
+    const resolved = resolveLocalPath(rawUrl, baseDir);
     const res = toDataUrlLocal(resolved, maxBytes);
-    if (res.ok) {
-      out.push(descriptor ? `${res.dataUrl} ${descriptor}` : res.dataUrl);
-    } else {
-      warnOnce(`srcset:${urlPart}`, res);
-      out.push(part);
+    if (res.ok) { counters.replacedCount++; return res.dataUrl; }
+    warnOnce(`${warnCtx}:${rawUrl}`, res);
+    return rawUrl;
+  };
+
+  const imgs = $("img");
+  for (const el of imgs) {
+    const $el = $(el);
+
+    // src
+    const oldSrc = $el.attr("src");
+    if (oldSrc) {
+      const newSrc = await inlineUrl(oldSrc, "src");
+      if (newSrc !== oldSrc) $el.attr("src", newSrc);
     }
-  }
-  return out.join(", ");
-}
 
-async function transformImgTag(tag, baseDir, maxBytes, counters) {
-  let changed = tag;
-
-  // src=
-  const src = getAttrFromTag(tag, "src");
-  if (src && !isDataUrl(src)) {
-    if (isRemote(src)) {
-      const p = remoteCache.get(src) || toDataUrlRemote(src, maxBytes);
-      remoteCache.set(src, p);
-      const res = await p;
-      if (res.ok) {
-        changed = replaceAttrInTag(changed, "src", res.dataUrl, src);
-        counters.replacedCount++;
-      } else {
-        warnOnce(`src:${src}`, res);
+    // srcset
+    const oldSrcset = $el.attr("srcset");
+    if (oldSrcset) {
+      const items = splitSrcset(oldSrcset);
+      let changed = false;
+      const newItems = [];
+      for (const item of items) {
+        const { url: partUrl, descriptor, raw } = parseSrcsetItem(item);
+        if (!partUrl) { newItems.push(raw); continue; }
+        const newUrl = await inlineUrl(partUrl, "srcset");
+        if (newUrl !== partUrl) changed = true;
+        newItems.push(descriptor ? `${newUrl} ${descriptor}` : newUrl);
       }
-    } else {
-      const resolved = resolveLocalPath(src, baseDir);
-      const res = toDataUrlLocal(resolved, maxBytes);
-      if (res.ok) {
-        changed = replaceAttrInTag(changed, "src", res.dataUrl, src);
-        counters.replacedCount++;
-      } else {
-        warnOnce(`src:${src}`, res);
+      if (changed) {
+        $el.attr("srcset", newItems.join(", "));
+        counters.srcsetCount++;
       }
     }
   }
 
-  // srcset=
-  const srcset = getAttrFromTag(tag, "srcset");
-  if (srcset) {
-    const newVal = await transformSrcsetValue(srcset, baseDir, maxBytes);
-    if (newVal !== srcset) {
-      changed = replaceAttrInTag(changed, "srcset", newVal, srcset);
-      counters.srcsetCount++;
-    }
-  }
-
-  return changed;
+  return $.html();
 }
 
-async function processHtml(html, baseDir, maxBytes, counters) {
-  const re = /<img\b[^>]*>/gi;
-  let last = 0;
-  let out = "";
-
-  const matches = [...html.matchAll(re)];
-  for (const m of matches) {
-    const idx = m.index ?? 0;
-    out += html.slice(last, idx);
-    const tag = m[0];
-    const newTag = await transformImgTag(tag, baseDir, maxBytes, counters);
-    out += newTag;
-    last = idx + tag.length;
-  }
-  out += html.slice(last);
-  return out;
-}
-
-// ---- CLI ----
+// ---------------- CLI entrypoint ----------------
 const args = process.argv.slice(2);
 if (!args[0]) usageAndExit();
 
@@ -397,7 +357,7 @@ try {
 const counters = { replacedCount: 0, srcsetCount: 0 };
 
 (async () => {
-  const outHtml = await processHtml(html, baseDir, MAX_BYTES, counters);
+  const outHtml = await processHtmlWithCheerio(html, baseDir, MAX_BYTES, counters);
 
   if (output) {
     if (path.resolve(output) === inputPath) {
