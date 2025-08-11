@@ -19,7 +19,7 @@ import path from "path";
 import url from "url";
 import http from "http";
 import https from "https";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";
 
 // ---------------- MIME map ----------------
 const extsToMime = {
