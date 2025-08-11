@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * inline-local-images.mjs  —  v1.1
- * Inlines local <img src> and srcset entries into data: URLs.
- * - Skips data:, http(s):, and protocol-relative // URLs.
- * - URL-decodes %XX in paths (handles %20 spaces, etc).
- * - Strips ?query and #hash for local file lookups.
- * - Case-insensitive fallback resolution across path segments.
- * - Warns once per missing/too-large file.
- * - Resolves relative to input file dir, or --root.
+ * inline-local-images.mjs  —  v2.0
+ * Inlines <img src> and srcset entries into data: URLs.
+ * - Now supports http(s): and protocol-relative // URLs (downloads & inlines).
+ * - Skips existing data: URLs.
+ * - URL-decodes %XX in local paths; strips ?query/#hash for local lookups.
+ * - Case-insensitive fallback resolution across path segments (locals).
+ * - Warns once per missing/too-large/unreadable/failed-remote file.
+ * - Resolves locals relative to input file dir, or --root.
  *
  * Usage:
  *   node inline-local-images.mjs <input.html> [-o output.html] [--root DIR] [--maxMB 10]
@@ -16,6 +16,8 @@
 import fs from "fs";
 import path from "path";
 import url from "url";
+import http from "http";
+import https from "https";
 
 const extsToMime = {
   png:  "image/png",
@@ -34,8 +36,16 @@ function usageAndExit() {
   process.exit(1);
 }
 
-function isRemoteOrData(src) {
-  return /^(data:|https?:|\/\/)/i.test(src);
+function isDataUrl(src) {
+  return /^data:/i.test(src);
+}
+
+function isRemote(src) {
+  return /^(https?:|\/\/)/i.test(src);
+}
+
+function normalizeRemoteUrl(u) {
+  return u.startsWith("//") ? "https:" + u : u;
 }
 
 function decodeMaybeURI(p) {
@@ -43,7 +53,6 @@ function decodeMaybeURI(p) {
 }
 
 function stripQueryHash(p) {
-  // remove ?query and #hash (for local filesystem paths)
   const iQ = p.indexOf("?");
   const iH = p.indexOf("#");
   const cut = Math.min(iQ === -1 ? p.length : iQ, iH === -1 ? p.length : iH);
@@ -58,7 +67,6 @@ function stripQueryHash(p) {
  * - if not found, tries case-insensitive traversal segment-by-segment
  */
 function resolveLocalPath(rawSrc, baseDir) {
-  // file:// URL?
   if (rawSrc.startsWith("file://")) {
     try { return url.fileURLToPath(rawSrc); } catch { /* fall through */ }
   }
@@ -66,28 +74,47 @@ function resolveLocalPath(rawSrc, baseDir) {
   const decoded = decodeMaybeURI(rawSrc);
   const noQH = stripQueryHash(decoded);
 
-  // Resolve relative to baseDir
   const candidate = path.resolve(baseDir, noQH);
   if (fs.existsSync(candidate)) return candidate;
 
-  // Case-insensitive fallback: walk each segment
   const norm = path.normalize(noQH);
   const parts = norm.split(/[\\/]+/).filter(Boolean);
   let cur = path.resolve(baseDir);
 
   for (const part of parts) {
     if (!fs.existsSync(cur) || !fs.statSync(cur).isDirectory()) {
-      // base directory missing; return the best-effort candidate
       return candidate;
     }
     const entries = fs.readdirSync(cur);
     const matched = entries.find(e => e.toLowerCase() === part.toLowerCase());
     cur = path.join(cur, matched || part);
   }
-  return cur; // may or may not exist; caller checks
+  return cur;
 }
 
-function toDataUrl(filePath, maxBytes) {
+function bufferToDataUrl(buf, fallbackPathOrExt, contentTypeHeader) {
+  let mime = null;
+
+  // Prefer server-provided content-type if present and looks like image/*
+  if (contentTypeHeader && /^image\/[a-z0-9.+-]+/i.test(contentTypeHeader)) {
+    mime = contentTypeHeader.split(";")[0].trim();
+  }
+
+  // Fallback to extension
+  if (!mime && fallbackPathOrExt) {
+    const ext = (fallbackPathOrExt.includes(".")
+      ? path.extname(fallbackPathOrExt).slice(1)
+      : fallbackPathOrExt
+    ).toLowerCase();
+    mime = extsToMime[ext] || null;
+  }
+
+  if (!mime) mime = "application/octet-stream";
+  const base64 = Buffer.from(buf).toString("base64");
+  return `data:${mime};base64,${base64}`;
+}
+
+function toDataUrlLocal(filePath, maxBytes) {
   if (!fs.existsSync(filePath)) return { ok: false, reason: "not_found" };
   const stat = fs.statSync(filePath);
   if (!stat.isFile()) return { ok: false, reason: "not_file" };
@@ -100,10 +127,103 @@ function toDataUrl(filePath, maxBytes) {
     return { ok: false, reason: "read_error", err: e };
   }
 
-  const ext = path.extname(filePath).slice(1).toLowerCase();
-  const mime = extsToMime[ext] || "application/octet-stream";
-  const base64 = buf.toString("base64");
-  return { ok: true, dataUrl: `data:${mime};base64,${base64}` };
+  return { ok: true, dataUrl: bufferToDataUrl(buf, filePath) };
+}
+
+// ---- Remote fetching (http/https) with redirects and hard size cap ----
+async function fetchRemoteBuffer(u, maxBytes, { timeoutMs = 15000, maxRedirects = 5 } = {}) {
+  const visited = new Set();
+
+  async function doFetch(currentUrl, redirectsLeft) {
+    if (visited.has(currentUrl)) throw new Error("redirect_loop");
+    visited.add(currentUrl);
+
+    const uObj = new URL(currentUrl);
+    const mod = uObj.protocol === "http:" ? http : https;
+
+    return new Promise((resolve, reject) => {
+      const req = mod.get({
+        protocol: uObj.protocol,
+        hostname: uObj.hostname,
+        port: uObj.port,
+        path: uObj.pathname + uObj.search,
+        headers: {
+          "User-Agent": "inline-local-images/2.0 (+https://example.invalid)",
+          "Accept": "*/*",
+          "Accept-Encoding": "identity"
+        },
+        timeout: timeoutMs
+      }, (res) => {
+        const { statusCode = 0, headers } = res;
+
+        // Handle redirects
+        if ([301,302,303,307,308].includes(statusCode)) {
+          res.resume(); // drain
+          const loc = headers.location;
+          if (!loc) return reject(new Error("redirect_without_location"));
+          if (redirectsLeft <= 0) return reject(new Error("too_many_redirects"));
+          const next = new URL(loc, currentUrl).toString();
+          doFetch(next, redirectsLeft - 1).then(resolve, reject);
+          return;
+        }
+
+        if (statusCode < 200 || statusCode >= 300) {
+          res.resume();
+          return reject(new Error(`http_${statusCode}`));
+        }
+
+        const cl = headers["content-length"] ? parseInt(headers["content-length"], 10) : null;
+        if (Number.isFinite(cl) && cl > maxBytes) {
+          res.resume();
+          const err = new Error("too_large");
+          err.size = cl;
+          return reject(err);
+        }
+
+        const chunks = [];
+        let total = 0;
+
+        res.on("data", (chunk) => {
+          total += chunk.length;
+          if (total > maxBytes) {
+            req.destroy(new Error("too_large_stream"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on("end", () => resolve({ buffer: Buffer.concat(chunks), contentType: headers["content-type"] || null }));
+        res.on("error", reject);
+      });
+
+      req.on("timeout", () => req.destroy(new Error("timeout")));
+      req.on("error", reject);
+    });
+  }
+
+  return doFetch(u, maxRedirects);
+}
+
+async function toDataUrlRemote(remoteUrl, maxBytes) {
+  const normalized = normalizeRemoteUrl(remoteUrl);
+  try {
+    const { buffer, contentType } = await fetchRemoteBuffer(normalized, maxBytes);
+    return { ok: true, dataUrl: bufferToDataUrl(buffer, path.extname(new URL(normalized).pathname).slice(1), contentType) };
+  } catch (e) {
+    const reasonMap = {
+      timeout: "remote_timeout",
+      redirect_loop: "remote_redirect_loop",
+      redirect_without_location: "remote_redirect_no_location",
+      too_many_redirects: "remote_too_many_redirects",
+      too_large: "too_large",
+      too_large_stream: "too_large",
+    };
+    const msg = String(e?.message || "");
+    const httpMatch = msg.startsWith("http_") ? "remote_http_error" : null;
+    const reason = reasonMap[msg] || httpMatch || "remote_error";
+    const out = { ok: false, reason };
+    if (e?.size) out.size = e.size;
+    return out;
+  }
 }
 
 function replaceAttrInTag(tag, attr, newValue, originalValue) {
@@ -122,7 +242,34 @@ function getAttrFromTag(tag, attr = "src") {
   return m[2] ?? m[3] ?? m[4] ?? null;
 }
 
-function transformSrcsetValue(srcset, baseDir, maxBytes, warnOnce) {
+// Warn-once helper
+const seenWarn = new Set();
+function warnOnce(key, resOrMsg) {
+  if (seenWarn.has(key)) return;
+  seenWarn.add(key);
+  if (typeof resOrMsg === "string") {
+    console.error(`[warn] ${resOrMsg}`);
+    return;
+  }
+  const reasons = {
+    not_found:  `File not found`,
+    not_file:   `Not a file`,
+    too_large:  `File too large${resOrMsg.size ? ` (${resOrMsg.size} bytes)` : ""}`,
+    read_error: `Read error: ${resOrMsg.err?.message || "unknown"}`,
+    remote_timeout: `Remote timeout`,
+    remote_redirect_loop: `Remote redirect loop`,
+    remote_redirect_no_location: `Remote redirect without Location`,
+    remote_too_many_redirects: `Too many redirects`,
+    remote_http_error: `Remote HTTP error`,
+    remote_error: `Remote fetch error`,
+  };
+  console.error(`[warn] ${key} → ${reasons[resOrMsg.reason] || resOrMsg.reason}`);
+}
+
+// cache for remote URLs within this run
+const remoteCache = new Map(); // url -> Promise<{ok, dataUrl}|{ok:false,...}>
+
+async function transformSrcsetValue(srcset, baseDir, maxBytes) {
   const parts = srcset.split(",").map(s => s.trim()).filter(Boolean);
   const out = [];
 
@@ -133,10 +280,22 @@ function transformSrcsetValue(srcset, baseDir, maxBytes, warnOnce) {
     const urlPart = match[1];
     const descriptor = (match[2] || "").trim();
 
-    if (isRemoteOrData(urlPart)) { out.push(part); continue; }
+    if (isDataUrl(urlPart)) { out.push(part); continue; }
 
+    // remote?
+    if (isRemote(urlPart)) {
+      const key = `remote:${urlPart}`;
+      const p = remoteCache.get(urlPart) || toDataUrlRemote(urlPart, maxBytes);
+      remoteCache.set(urlPart, p);
+      const res = await p;
+      if (res.ok) out.push(descriptor ? `${res.dataUrl} ${descriptor}` : res.dataUrl);
+      else { warnOnce(`srcset:${urlPart}`, res); out.push(part); }
+      continue;
+    }
+
+    // local file
     const resolved = resolveLocalPath(urlPart, baseDir);
-    const res = toDataUrl(resolved, maxBytes);
+    const res = toDataUrlLocal(resolved, maxBytes);
     if (res.ok) {
       out.push(descriptor ? `${res.dataUrl} ${descriptor}` : res.dataUrl);
     } else {
@@ -145,6 +304,65 @@ function transformSrcsetValue(srcset, baseDir, maxBytes, warnOnce) {
     }
   }
   return out.join(", ");
+}
+
+async function transformImgTag(tag, baseDir, maxBytes, counters) {
+  let changed = tag;
+
+  // src=
+  const src = getAttrFromTag(tag, "src");
+  if (src && !isDataUrl(src)) {
+    if (isRemote(src)) {
+      const p = remoteCache.get(src) || toDataUrlRemote(src, maxBytes);
+      remoteCache.set(src, p);
+      const res = await p;
+      if (res.ok) {
+        changed = replaceAttrInTag(changed, "src", res.dataUrl, src);
+        counters.replacedCount++;
+      } else {
+        warnOnce(`src:${src}`, res);
+      }
+    } else {
+      const resolved = resolveLocalPath(src, baseDir);
+      const res = toDataUrlLocal(resolved, maxBytes);
+      if (res.ok) {
+        changed = replaceAttrInTag(changed, "src", res.dataUrl, src);
+        counters.replacedCount++;
+      } else {
+        warnOnce(`src:${src}`, res);
+      }
+    }
+  }
+
+  // srcset=
+  const srcset = getAttrFromTag(tag, "srcset");
+  if (srcset) {
+    const newVal = await transformSrcsetValue(srcset, baseDir, maxBytes);
+    if (newVal !== srcset) {
+      changed = replaceAttrInTag(changed, "srcset", newVal, srcset);
+      counters.srcsetCount++;
+    }
+  }
+
+  return changed;
+}
+
+async function processHtml(html, baseDir, maxBytes, counters) {
+  const re = /<img\b[^>]*>/gi;
+  let last = 0;
+  let out = "";
+
+  const matches = [...html.matchAll(re)];
+  for (const m of matches) {
+    const idx = m.index ?? 0;
+    out += html.slice(last, idx);
+    const tag = m[0];
+    const newTag = await transformImgTag(tag, baseDir, maxBytes, counters);
+    out += newTag;
+    last = idx + tag.length;
+  }
+  out += html.slice(last);
+  return out;
 }
 
 // ---- CLI ----
@@ -176,71 +394,28 @@ try {
   process.exit(2);
 }
 
-// Warn-once helper
-const seenWarn = new Set();
-function warnOnce(key, resOrMsg) {
-  if (seenWarn.has(key)) return;
-  seenWarn.add(key);
-  if (typeof resOrMsg === "string") {
-    console.error(`[warn] ${resOrMsg}`);
-    return;
-  }
-  const reasons = {
-    not_found:  `File not found`,
-    not_file:   `Not a file`,
-    too_large:  `File too large (${resOrMsg.size} bytes)`,
-    read_error: `Read error: ${resOrMsg.err?.message || "unknown"}`
-  };
-  // key can include context like "src:<path>" or "srcset:<entry>"
-  console.error(`[warn] ${key} → ${reasons[resOrMsg.reason] || resOrMsg.reason}`);
-}
+const counters = { replacedCount: 0, srcsetCount: 0 };
 
-let replacedCount = 0;
-let srcsetCount = 0;
+(async () => {
+  const outHtml = await processHtml(html, baseDir, MAX_BYTES, counters);
 
-const out = html.replace(/<img\b[^>]*>/gi, (tag) => {
-  let changed = tag;
-
-  // src=
-  const src = getAttrFromTag(tag, "src");
-  if (src && !isRemoteOrData(src)) {
-    const resolved = resolveLocalPath(src, baseDir);
-    const res = toDataUrl(resolved, MAX_BYTES);
-    if (res.ok) {
-      changed = replaceAttrInTag(changed, "src", res.dataUrl, src);
-      replacedCount++;
-    } else {
-      warnOnce(`src:${src}`, res);
+  if (output) {
+    if (path.resolve(output) === inputPath) {
+      console.error(`[error] Refusing to overwrite input. Choose a different -o.`);
+      process.exit(3);
     }
-  }
-
-  // srcset=
-  const srcset = getAttrFromTag(tag, "srcset");
-  if (srcset) {
-    const newVal = transformSrcsetValue(srcset, baseDir, MAX_BYTES, warnOnce);
-    if (newVal !== srcset) {
-      changed = replaceAttrInTag(changed, "srcset", newVal, srcset);
-      srcsetCount++;
+    try {
+      fs.writeFileSync(output, outHtml, "utf8");
+    } catch (e) {
+      console.error(`[error] Could not write ${output}: ${e.message}`);
+      process.exit(4);
     }
+    console.error(`[info] Inlined ${counters.replacedCount} src image(s), updated ${counters.srcsetCount} srcset(s) → ${output}`);
+  } else {
+    process.stdout.write(outHtml);
+    console.error(`\n[info] Inlined ${counters.replacedCount} src image(s), updated ${counters.srcsetCount} srcset(s) → stdout`);
   }
-
-  return changed;
+})().catch((e) => {
+  console.error(`[error] Unexpected failure: ${e?.stack || e}`);
+  process.exit(5);
 });
-
-if (output) {
-  if (path.resolve(output) === inputPath) {
-    console.error(`[error] Refusing to overwrite input. Choose a different -o.`);
-    process.exit(3);
-  }
-  try {
-    fs.writeFileSync(output, out, "utf8");
-  } catch (e) {
-    console.error(`[error] Could not write ${output}: ${e.message}`);
-    process.exit(4);
-  }
-  console.error(`[info] Inlined ${replacedCount} src image(s), updated ${srcsetCount} srcset(s) → ${output}`);
-} else {
-  process.stdout.write(out);
-  console.error(`\n[info] Inlined ${replacedCount} src image(s), updated ${srcsetCount} srcset(s) → stdout`);
-}
-
