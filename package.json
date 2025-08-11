@@ -1,6 +1,6 @@
 {
   "name": "yet-another-html-img-inliner",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Inline local <img src> and srcset references in HTML into data: URLs (no remote fetches).",
   "type": "module",
   "bin": {
