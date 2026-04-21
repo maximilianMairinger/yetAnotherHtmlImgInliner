@@ -91,9 +91,3 @@ yet-another-html-img-inliner newsletter.html -o newsletter.inline.html
   * Aborts downloads exceeding `--maxMB` limit.
   * Requires network access at runtime.
 * Refuses to overwrite the input file; choose a different `-o`.
-
----
-
-```
-
-Do you want me to also add an **“Advanced”** section to the README describing the redirect, timeout, and caching behavior of remote inlining? That could make the new behavior crystal-clear.
